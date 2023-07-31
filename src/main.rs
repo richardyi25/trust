@@ -1,8 +1,13 @@
+use std::net::SocketAddr;
 use std::sync::{Mutex, Arc};
-use std::{net::TcpListener, collections::{HashSet, HashMap}};
+use std::collections::{HashSet, HashMap};
+use futures::{StreamExt, TryStreamExt, future, pin_mut};
 use rand::Rng;
-use tungstenite::Message::{Text, Close};
+use tokio::net::{TcpListener, TcpStream};
+use tungstenite::Message::Text;
 use serde::{Deserialize, Serialize};
+use futures::channel::mpsc::{unbounded, UnboundedSender};
+use tokio_tungstenite::tungstenite::protocol::Message;
 
 type IDsize = u64;
 type Cardsize = u8;
@@ -25,7 +30,8 @@ enum ClientMessage {
 	PlaceCard { card: Cardsize },
 	Bid { bid: Bidsize },
 	Pass,
-	Pickup { player_index: usize }
+	Pickup { player_index: usize },
+	Debug
 }
 
 #[derive(Serialize)]
@@ -49,7 +55,13 @@ enum ClientResponse<'a>{
 	ValidMove,
 	RedCard,
 	BlackCard,
-	WonGame
+	WonGame,
+	Debug(&'a GameState)
+}
+
+#[derive(Serialize)]
+enum BroadcastMessage {
+	None
 }
 
 #[derive(Serialize)]
@@ -71,6 +83,7 @@ enum GameStage {
 	Flipping { flipper: IDsize, required: Bidsize, flipped: Vec<Cardsize> },
 }
 
+#[derive(Serialize)]
 struct GameState {
 	unique_names: HashSet<String>,
 	players: HashMap<IDsize, PlayerState>,
@@ -80,87 +93,119 @@ struct GameState {
 	current_player_index: usize
 }
 
-#[tokio::main]
-async fn main () {
-	let server = TcpListener::bind("127.0.0.1:9001").unwrap();
-	let global_state = GameState {
+type Tx = UnboundedSender<Message>;
+type PeerMap = Arc<Mutex<HashMap<SocketAddr, Tx>>>;
+
+// A large part of this function is taken from the example code in tokio-tungstenite library
+// https://github.com/snapview/tokio-tungstenite/blob/ac30533aa001aea01f44d24ab82f56067c73701d/examples/server.rs
+// The code is under the same MIT license as the crate
+async fn handle_connection(peer_map: PeerMap, raw_stream: TcpStream, addr: SocketAddr, state: Arc<Mutex<GameState>>) {
+    println!("Incoming TCP connection from: {}", addr);
+
+    let ws_stream = tokio_tungstenite::accept_async(raw_stream)
+        .await
+        .expect("Error during the websocket handshake occurred");
+    println!("WebSocket connection established: {}", addr);
+
+	let id: Option<IDsize> = None;
+
+    let (tx, rx) = unbounded();
+    peer_map.lock().unwrap().insert(addr, tx);
+
+    let (outgoing, incoming) = ws_stream.split();
+
+	// An entire execution of each of these blocks will complete before another message is received
+	// However, the other between broadcasting and receiving is not deterministic
+
+    let broadcast_incoming = incoming.try_for_each(|msg| {
+		match msg {
+			Text(text) => {
+				println!("Received a message from {}: {}", addr, &text);
+				let peers = peer_map.lock().unwrap();
+
+				let self_peer =
+					peers.iter().filter(|(peer_addr, _)| peer_addr == &&addr).map(|(_, ws_sink)| ws_sink);
+
+				let state_borrow = &mut *state.lock().unwrap();
+
+				let (response_message, broadcast_message) =
+					handle_message(&text, id, state_borrow);
+				let response_text = serde_json::to_string(&response_message).unwrap();
+				let broadcast_text = serde_json::to_string(&broadcast_message).unwrap();
+
+				println!("Number of peers: {}", peers.len());
+
+				for (_, sender) in peers.iter() {
+					sender.unbounded_send(Text(broadcast_text.clone())).unwrap();
+					println!("Broadcast a message!");
+				}
+
+				for sender in self_peer {
+					sender.unbounded_send(Text(response_text.clone())).unwrap();
+					println!("Sent a response!");
+				}
+			}
+			_ => ()
+		}
+
+        future::ok(())
+    });
+
+    let receive_from_others = rx.map(Ok).forward(outgoing);
+
+    pin_mut!(broadcast_incoming, receive_from_others);
+    future::select(broadcast_incoming, receive_from_others).await;
+
+    println!("{} disconnected", &addr);
+    peer_map.lock().unwrap().remove(&addr);
+}
+
+#[tokio::main(flavor="current_thread")]
+async fn main() {
+    let addr = String::from("127.0.0.1:9001");
+
+    let pm_state = PeerMap::new(Mutex::new(HashMap::new()));
+	let game_state = Arc::new(Mutex::new(GameState {
 		unique_names: HashSet::new(),
 		players: HashMap::new(),
 		stage: GameStage::Lobby { winner: None },
 		host_id: None,
 		id_list: Vec::new(),
-		current_player_index: 0
-	};
+		current_player_index: 0	
+	}));
 
-	let state_mutex = Arc::new(Mutex::new(global_state));
+    let try_socket = TcpListener::bind(&addr).await;
+    let listener = try_socket.expect("Failed to bind");
+    println!("Listening on: {}", addr);
 
-	for stream in server.incoming() {
-		let state_clone = Arc::clone(&state_mutex);
-		tokio::spawn(async move {
-			let mut websocket = tungstenite::accept(stream.unwrap()).unwrap();
-			let mut player_id: Option<IDsize> = None;
-
-			println!("Connection established");
-
-			loop {
-				let result = websocket.read();
-
-				if let Ok(Text(text)) = result {
-					let state = &mut *state_clone.lock().unwrap();
-					let response = handle_message(&text, player_id, state);
-
-					match response {
-						ClientResponse::ValidJoin { id } |
-						ClientResponse::ValidRejoin { id, is_host: _ } => {
-							player_id = Some(id);
-						},
-						ClientResponse::ValidQuit => {
-							println!("Quit game");
-							break;
-						}
-						_ => ()
-					}
-
-					let message = serde_json::to_string(&response).unwrap();
-					websocket.write(Text(message))
-						.unwrap_or_else(|_| println!("Tried to write after closing"));
-					websocket.flush()
-						.unwrap_or_else(|_| println!("Tried to flush after closing"));
-				}
-				else if let Ok(Close(_)) = result {
-					println!("Connection closed");
-					break;
-				}
-				else if let Err(_) = result {
-					println!("Connection dropped");
-					break;
-				}
-			}
-		});
-	}
+    while let Ok((stream, addr)) = listener.accept().await {
+        tokio::spawn(handle_connection(pm_state.clone(), stream, addr, game_state.clone()));
+    }
 }
 
-fn handle_message<'a>(text: &str, maybe_id: Option<IDsize>, state: &'a mut GameState) -> ClientResponse<'a> {
+fn handle_message<'a>(text: &str, maybe_id: Option<IDsize>, state: &'a mut GameState)
+	-> (ClientResponse<'a>, BroadcastMessage) {
+
 	let message_result = serde_json::from_str::<ClientMessage>(text);
 
 	if let Err(_) = message_result {
-		return ClientResponse::InvalidJSON;
+		return (ClientResponse::InvalidJSON, BroadcastMessage::None);
 	}
 	let message = message_result.unwrap();
 
+	// in the future, split hande message into id-required and join-type messages
 	if let None = maybe_id {
 		match message {
 			ClientMessage::Join { name: _ } | ClientMessage::Rejoin { id: _ } => (),
-			_ => { return ClientResponse::NotJoined; }
+			_ => { return (ClientResponse::NotJoined, BroadcastMessage::None); }
 		}
 	}
-	let id = maybe_id.unwrap();
 
 	//              should change this to be the cloned value, not ref to it
 	match (message, &state.stage.clone()) {
 		(ClientMessage::Join { name }, GameStage::Lobby { winner: _ }) => {
 			if state.unique_names.contains(&name) {
-				return ClientResponse::NameTaken;
+				return (ClientResponse::NameTaken, BroadcastMessage::None);
 			}
 
 			let mut id: IDsize;
@@ -190,25 +235,27 @@ fn handle_message<'a>(text: &str, maybe_id: Option<IDsize>, state: &'a mut GameS
 				state.host_id = Some(id);
 			}
 
-			return ClientResponse::ValidJoin { id };
+			return (ClientResponse::ValidJoin { id }, BroadcastMessage::None);
 		},
 
 		(ClientMessage::Rejoin { id }, _) => {
 			if state.players.contains_key(&id) {
 				if let Some(host_id) = state.host_id {
 					if host_id == id {
-						return ClientResponse::ValidRejoin { id, is_host: true }
+						return (ClientResponse::ValidRejoin { id, is_host: true }, BroadcastMessage::None);
 					}
 				}
 
-				return ClientResponse::ValidRejoin { id, is_host: false };
+				return (ClientResponse::ValidRejoin { id, is_host: false }, BroadcastMessage::None);
 			}
 			else {
-				ClientResponse::InvalidRequest
+				(ClientResponse::InvalidRequest, BroadcastMessage::None)
 			}
 		},
 
 		(ClientMessage::Quit, GameStage::Lobby { winner: _ }) => {
+			let id = maybe_id.unwrap();
+
 			let player = state.players.get(&id).unwrap();
 			state.unique_names.remove(&player.name);
 			state.players.remove(&id);
@@ -219,42 +266,51 @@ fn handle_message<'a>(text: &str, maybe_id: Option<IDsize>, state: &'a mut GameS
 				}
 			}
 
-			ClientResponse::ValidQuit
+			(ClientResponse::ValidQuit, BroadcastMessage::None)
 		}
 
 		(ClientMessage::GetState, _) => {
+			let id = maybe_id.unwrap();
+
 			let maybe_player = state.players.get(&id);
 			
 			if let Some(player_state) = maybe_player {
-				ClientResponse::State {
-					player_state: player_state,
-					game_stage: &state.stage,
-					current_player_index: state.current_player_index,
-					players_num_cards: state.id_list
-						.iter()
-						.map(|id| state.players[id].placed.len() as Cardsize)
-						.collect()
-				}
+				(
+					ClientResponse::State {
+						player_state: player_state,
+						game_stage: &state.stage,
+						current_player_index: state.current_player_index,
+						players_num_cards: state.id_list
+							.iter()
+							.map(|id| state.players[id].placed.len() as Cardsize)
+							.collect()
+					},
+					BroadcastMessage::None
+				)
 			}
 			else {
-				ClientResponse::InvalidRequest
+				(ClientResponse::InvalidRequest, BroadcastMessage::None)
 			}
 		},
 
 		(ClientMessage::StartGame, GameStage::Lobby { winner: _ }) => {
+			let id = maybe_id.unwrap();
+
 			if let Some(host_id) = state.host_id {
 				if host_id == id {
 					start_game(state);
-					return ClientResponse::GameStarted;
+					return (ClientResponse::GameStarted, BroadcastMessage::None);
 				}
 			}
 
-			ClientResponse::InvalidRequest
+			(ClientResponse::InvalidRequest, BroadcastMessage::None)
 		},
 
 		(ClientMessage::PlaceCard { card }, GameStage::InitialCard) => {
+			let id = maybe_id.unwrap();
+
 			if card > 3 {
-				return ClientResponse::InvalidRequest;
+				return (ClientResponse::InvalidRequest, BroadcastMessage::None);
 			}
 
 			let maybe_player = state.players.get_mut(&id);
@@ -265,46 +321,54 @@ fn handle_message<'a>(text: &str, maybe_id: Option<IDsize>, state: &'a mut GameS
 					if state.players.iter().all(|(_, player)| player.placed.len() == 1) {
 						state.stage = GameStage::Turns;
 					}
-					return ClientResponse::ValidMove;
+					return (ClientResponse::ValidMove, BroadcastMessage::None);
 				}
 			}
 
-			ClientResponse::InvalidRequest
+			(ClientResponse::InvalidRequest, BroadcastMessage::None)
 		},
 
 		(ClientMessage::PlaceCard { card }, GameStage::Turns) => {
+			let id = maybe_id.unwrap();
+
 			let current_id = state.id_list[state.current_player_index];
 			if card > 3 || id != current_id {
-				return ClientResponse::InvalidRequest;
+				return (ClientResponse::InvalidRequest, BroadcastMessage::None);
 			}
 
 			let player = state.players.get_mut(&id).unwrap();
 			player.placed.push(card);
 			increment_turn(state);
 
-			ClientResponse::ValidMove
+			(ClientResponse::ValidMove, BroadcastMessage::None)
 		},
 
 		(ClientMessage::Bid { bid }, GameStage::Turns) => {
+			let id = maybe_id.unwrap();
+
 			let current_id = state.id_list[state.current_player_index];
 			if id == current_id {
 				state.stage = GameStage::Bidding { highest_bidder: id, highest_bid: bid };
-				return ClientResponse::ValidMove;
+				return (ClientResponse::ValidMove, BroadcastMessage::None);
 			}
 
-			ClientResponse::InvalidRequest
+			(ClientResponse::InvalidRequest, BroadcastMessage::None)
 		}
 
 		(ClientMessage::Bid { bid }, GameStage::Bidding { highest_bidder: _, highest_bid }) => {
+			let id = maybe_id.unwrap();
+
 			if bid > *highest_bid {
 				state.stage = GameStage::Bidding { highest_bidder: id, highest_bid: bid };
-				return ClientResponse::ValidMove;
+				return (ClientResponse::ValidMove, BroadcastMessage::None);
 			}
 
-			ClientResponse::InvalidRequest
+			(ClientResponse::InvalidRequest, BroadcastMessage::None)
 		}
 
 		(ClientMessage::Pass, GameStage::Bidding { highest_bidder, highest_bid }) => {
+			let id = maybe_id.unwrap();
+
 			let maybe_player = state.players.get_mut(&id);
 			if let Some(player) = maybe_player {
 				player.passed = true;
@@ -316,15 +380,17 @@ fn handle_message<'a>(text: &str, maybe_id: Option<IDsize>, state: &'a mut GameS
 					}
 				}
 
-				return ClientResponse::ValidMove;
+				return (ClientResponse::ValidMove, BroadcastMessage::None);
 			}
 
-			ClientResponse::InvalidRequest
+			(ClientResponse::InvalidRequest, BroadcastMessage::None)
 		}
 
 		(ClientMessage::Pickup { player_index }, GameStage::Flipping { flipper, required, flipped }) => {
+			let id = maybe_id.unwrap();
+
 			if player_index > state.id_list.len() {
-				return ClientResponse::InvalidRequest;
+				return (ClientResponse::InvalidRequest, BroadcastMessage::None);
 			}
 
 			let flipped_card: Cardsize;
@@ -335,7 +401,7 @@ fn handle_message<'a>(text: &str, maybe_id: Option<IDsize>, state: &'a mut GameS
 					flipped_card = card;
 				}
 				else {
-					return ClientResponse::InvalidRequest;
+					return (ClientResponse::InvalidRequest, BroadcastMessage::None);
 				}
 			}
 
@@ -344,7 +410,7 @@ fn handle_message<'a>(text: &str, maybe_id: Option<IDsize>, state: &'a mut GameS
 				let lost_card = rand::thread_rng().gen_range(0..player.owned.len());
 				player.owned.remove(lost_card);
 				start_next_round(state, flipper);
-				ClientResponse::RedCard
+				(ClientResponse::RedCard, BroadcastMessage::None)
 			}
 			else {
 				let mut new_flipped = flipped.clone();
@@ -354,7 +420,7 @@ fn handle_message<'a>(text: &str, maybe_id: Option<IDsize>, state: &'a mut GameS
 					player.points += 1;
 					if player.points == 2 {
 						start_next_game(state, id);
-						return ClientResponse::WonGame;
+						return (ClientResponse::WonGame, BroadcastMessage::None);
 					}
 					start_next_round(state, flipper);
 				}
@@ -366,11 +432,20 @@ fn handle_message<'a>(text: &str, maybe_id: Option<IDsize>, state: &'a mut GameS
 					};
 				}
 
-				ClientResponse::BlackCard
+				(ClientResponse::BlackCard, BroadcastMessage::None)
 			}
 		}
 
-		(_, _) => ClientResponse::InvalidRequest
+		(ClientMessage::Debug, _) => {
+			if DEBUG {
+				(ClientResponse::Debug(state), BroadcastMessage::None)
+			}
+			else {
+				(ClientResponse::InvalidRequest, BroadcastMessage::None)
+			}
+		}
+
+		(_, _) => (ClientResponse::InvalidRequest, BroadcastMessage::None)
 	}
 }
 
